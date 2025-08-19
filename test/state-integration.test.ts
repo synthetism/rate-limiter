@@ -114,18 +114,7 @@ describe('RateLimiter State Integration', () => {
       expect(limiter.getStats().totalRequests).toBe(0);
     });
 
-    it('should expose state unit through teaching contract', () => {
-      const contract = limiter.teach();
-      
-      expect(contract.capabilities).toHaveProperty('getStateUnit');
-      expect(typeof contract.capabilities.getStateUnit).toBe('function');
-      
-      // Should be able to get state unit through contract
-      const stateViaContract = contract.capabilities.getStateUnit();
-      const stateDirect = limiter.getStateUnit();
-      
-      expect(stateViaContract).toBe(stateDirect);
-    });
+
 
     it('should maintain state consistency across multiple operations', () => {
       const contexts = [

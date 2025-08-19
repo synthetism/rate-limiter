@@ -8,6 +8,7 @@ import {
   Schema,
   Validator
 } from '@synet/unit';
+import {  StateAsync } from '@synet/state';
 import type {
   RateLimitResult,
   RateLimitContext,
@@ -15,7 +16,6 @@ import type {
 } from './types.js';
 import { TokenBucket, type BucketInfo } from "./bucket.js";
 
-import { State } from '@synet/state';
 
 // === RATE LIMITER CORE ===
 
@@ -31,43 +31,43 @@ export interface RateLimiterProps extends UnitProps {
   window: number;
   burst: number;
   keyGenerator: (context: RateLimitContext) => string;
-  state: State;  // State unit for conscious state management
+  state: StateAsync;  // State unit for conscious state management
 }
 
-// === RATE LIMITER UNIT ===
 
-export class RateLimiter extends Unit<RateLimiterProps> {
+
+export class AsyncRateLimiter extends Unit<RateLimiterProps> {
   protected constructor(props: RateLimiterProps) {
     super(props);
   }
+   // v1.1.0 Consciousness Trinity (empty for composition units)
+  protected build(): UnitCore {
+    const capabilities = Capabilities.create(this.dna.id, {});
+    const schema = Schema.create(this.dna.id, {});
+    const validator = Validator.create({
+      unitId: this.dna.id,
+      capabilities,
+      schema,
+      strictMode: false
+    });
 
-    protected build(): UnitCore {
-      const capabilities = Capabilities.create(this.dna.id, {});
-      const schema = Schema.create(this.dna.id, {});
-      const validator = Validator.create({
-        unitId: this.dna.id,
-        capabilities,
-        schema,
-        strictMode: false
-      });
-  
-      return { capabilities, schema, validator };
-    }
-  
-  
-    // Consciousness Trinity Access
-    capabilities(): Capabilities { return this._unit.capabilities; }
-    schema(): Schema { return this._unit.schema; }
-    validator(): Validator { return this._unit.validator; }
-  
+    return { capabilities, schema, validator };
+  }
 
-  static create(config: RateLimiterConfig = {}): RateLimiter {
+
+  // Consciousness Trinity Access
+  capabilities(): Capabilities { return this._unit.capabilities; }
+  schema(): Schema { return this._unit.schema; }
+  validator(): Validator { return this._unit.validator; }
+
+
+  static create(config: RateLimiterConfig = {}): AsyncRateLimiter {
     const requests = config.requests || 100;
     const window = config.window || 60000; // 1 minute
     const burst = config.burst || 10;
     
     // Create state unit for conscious state management
-    const state = State.create({
+    const state = StateAsync.create({
       unitId: 'rate-limiter',
       initialState: {
         buckets: new Map<string, TokenBucket>(),
@@ -94,16 +94,16 @@ export class RateLimiter extends Unit<RateLimiterProps> {
       state
     };
 
-    return new RateLimiter(props);
+    return new AsyncRateLimiter(props);
   }
 
   // === CORE RATE LIMITING ===
 
-  checkLimit(context: RateLimitContext = {}): RateLimitResult {
+  async checkLimit(context: RateLimitContext = {}): Promise<RateLimitResult> {
     const key = this.props.keyGenerator(context);
     
     // Get buckets from state
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
+    const buckets = await this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
     
     // Get or create bucket for this key
     if (!buckets.has(key)) {
@@ -112,7 +112,7 @@ export class RateLimiter extends Unit<RateLimiterProps> {
         this.props.window,
         this.props.burst
       ));
-      this.props.state.set('buckets', buckets);
+      await this.props.state.set('buckets', buckets);
     }
 
     const bucket = buckets.get(key);
@@ -122,7 +122,7 @@ export class RateLimiter extends Unit<RateLimiterProps> {
     const result = bucket.consume();
 
     // Update statistics
-    this.updateStats(result.allowed);
+    await  this.updateStats(result.allowed);
 
     return result;
   }
@@ -130,7 +130,7 @@ export class RateLimiter extends Unit<RateLimiterProps> {
   // === ASYNC RATE LIMITING WITH BACKPRESSURE ===
 
   async limit<T>(operation: () => Promise<T>, context: RateLimitContext = {}): Promise<T> {
-    const result = this.checkLimit(context);
+    const result = await this.checkLimit(context);
     
     if (result.allowed) {
       return await operation();
@@ -154,7 +154,7 @@ export class RateLimiter extends Unit<RateLimiterProps> {
     let attempts = 0;
     
     while (attempts <= maxRetries) {
-      const result = this.checkLimit(context);
+      const result = await this.checkLimit(context);
       
       if (result.allowed) {
         return await operation();
@@ -179,8 +179,8 @@ export class RateLimiter extends Unit<RateLimiterProps> {
 
   // === STATISTICS & MONITORING ===
 
-  private updateStats(allowed: boolean): void {
-    const stats = this.props.state.get<RateLimitStats>('stats') || {
+  private async updateStats(allowed: boolean): Promise<void> {
+    const stats = await this.props.state.get<RateLimitStats>('stats') || {
       totalRequests: 0,
       allowedRequests: 0,
       blockedRequests: 0,
@@ -197,7 +197,7 @@ export class RateLimiter extends Unit<RateLimiterProps> {
       stats.blockedRequests++;
     }
 
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
+    const buckets = await this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
     stats.activeBuckets = buckets.size;
     stats.allowRate = stats.totalRequests > 0 
       ? stats.allowedRequests / stats.totalRequests
@@ -206,8 +206,8 @@ export class RateLimiter extends Unit<RateLimiterProps> {
     this.props.state.set('stats', stats);
   }
 
-  getStats(): RateLimitStats {
-    const stats = this.props.state.get<RateLimitStats>('stats') || {
+  async getStats(): Promise<RateLimitStats> {
+    const stats = await this.props.state.get<RateLimitStats>('stats') || {
       totalRequests: 0,
       allowedRequests: 0,
       blockedRequests: 0,
@@ -218,14 +218,14 @@ export class RateLimiter extends Unit<RateLimiterProps> {
     return { ...stats };
   }
 
-  getBucketInfo(key: string) {
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
+  async getBucketInfo(key: string) {
+    const buckets = await this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
     const bucket = buckets.get(key);
     return bucket ? bucket.getInfo() : null;
   }
 
-  getAllBuckets(): Record<string, BucketInfo> {
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
+  async getAllBuckets(): Promise<Record<string, BucketInfo>> {
+    const buckets = await this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
     const result: Record<string, BucketInfo> = {};
     
     for (const [key, bucket] of buckets.entries()) {
@@ -237,13 +237,13 @@ export class RateLimiter extends Unit<RateLimiterProps> {
 
   // === MANAGEMENT ===
 
-  getStateUnit(): State {
+  getStateUnit(): StateAsync {
     return this.props.state;
   }
 
-  reset(key?: string): void {
+  async reset(key?: string): Promise<void> {
     if (key) {
-      const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
+      const buckets = await this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
       buckets.delete(key);
       this.props.state.set('buckets', buckets);
     } else {
@@ -266,8 +266,6 @@ export class RateLimiter extends Unit<RateLimiterProps> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }
 
-  // === UNIT ARCHITECTURE ===
-
  
  teach(): TeachingContract {
     return {
@@ -280,7 +278,7 @@ export class RateLimiter extends Unit<RateLimiterProps> {
 
   whoami(): string {
     const stats = this.getStats();
-    return `RateLimiter[${this.props.requests}req/${this.props.window}ms, ${stats.activeBuckets} buckets, ${(stats.allowRate * 100).toFixed(1)}% allowed] - v${this.dna.version}`;
+    return `RateLimiter[${this.props.requests}req/${this.props.window}ms`;
   }
 
   help(): string {
@@ -291,12 +289,7 @@ RateLimiter v${this.dna.version} - Conscious Rate Limiting
 Configuration:
 • Requests: ${this.props.requests} per ${this.props.window}ms window
 • Burst: ${this.props.burst} extra tokens
-• Active Buckets: ${stats.activeBuckets}
 
-Statistics:
-• Total Requests: ${stats.totalRequests}
-• Allowed: ${stats.allowedRequests} (${(stats.allowRate * 100).toFixed(1)}%)
-• Blocked: ${stats.blockedRequests}
 
 CORE METHODS:
 • checkLimit(context?) - Check if request is allowed
@@ -327,7 +320,6 @@ Example:
   }
 }
 
-// === CUSTOM ERROR ===
 
 export class RateLimitError extends Error {
   constructor(message: string, public result: RateLimitResult) {
@@ -336,4 +328,4 @@ export class RateLimitError extends Error {
   }
 }
 
-export default RateLimiter;
+export default AsyncRateLimiter;
