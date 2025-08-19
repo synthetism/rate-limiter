@@ -1,5 +1,6 @@
-
 export interface RateLimitContext {
+  clientId?: string;
+  resource?: string;
   key?: string;
   userId?: string;
   ip?: string;
@@ -9,10 +10,10 @@ export interface RateLimitContext {
 export interface RateLimitStats {
   totalRequests: number;
   allowedRequests: number;
-  blockedRequests: number;
-  activeBuckets: number;
-  allowRate: number;
-  created: number;
+  rejectedRequests: number;
+  totalKeys: number;
+  avgResponseTime: number;
+  bucketsCreated: number;
 }
 
 export interface RateLimitResult {
@@ -20,4 +21,5 @@ export interface RateLimitResult {
   remaining: number;
   resetTime: number;
   retryAfter?: number;
+  key?: string;
 }

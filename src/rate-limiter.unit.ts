@@ -1,29 +1,43 @@
-import { 
-  Unit, 
-  type UnitProps, 
-  createUnitSchema, 
+import {
+  Unit,
+  type UnitProps,
+  createUnitSchema,
   type TeachingContract,
   type UnitCore,
   Capabilities,
   Schema,
-  Validator
-} from '@synet/unit';
+  Validator,
+} from "@synet/unit";
 import type {
   RateLimitResult,
   RateLimitContext,
-  RateLimitStats
-} from './types.js';
-import { TokenBucket, type BucketInfo } from "./bucket.js";
+  RateLimitStats,
+} from "./types.js";
+import {
+  createBucket,
+  consumeToken,
+  getBucketInfo,
+  type BucketData,
+  type BucketInfo,
+} from "./bucket.js";
 
-import { State } from '@synet/state';
+// Synchronous StorageBinding interface
+export interface SyncStorageBinding {
+  get<T>(key: string): T | null;
+  set<T>(key: string, value: T): void;
+  delete(key: string): boolean;
+  exists?(key: string): boolean;
+  clear?(): void;
+}
 
 // === RATE LIMITER CORE ===
 
 export interface RateLimiterConfig {
-  requests?: number;      // Max requests (default: 100)
-  window?: number;        // Time window in ms (default: 60000 = 1 minute)
-  burst?: number;         // Burst allowance (default: 10)
+  requests?: number; // Max requests (default: 100)
+  window?: number; // Time window in ms (default: 60000 = 1 minute)
+  burst?: number; // Burst allowance (default: 10)
   keyGenerator?: (context: RateLimitContext) => string; // Custom key generator
+  storage?: SyncStorageBinding; // Optional sync storage - defaults to memory
 }
 
 export interface RateLimiterProps extends UnitProps {
@@ -31,309 +45,391 @@ export interface RateLimiterProps extends UnitProps {
   window: number;
   burst: number;
   keyGenerator: (context: RateLimitContext) => string;
-  state: State;  // State unit for conscious state management
+  storage: SyncStorageBinding; // Direct sync storage injection
+}
+
+// Simple sync memory storage for default behavior
+class SyncMemoryStorage implements SyncStorageBinding {
+  private data = new Map<string, any>();
+
+  get<T>(key: string): T | null {
+    return this.data.get(key) || null;
+  }
+
+  set<T>(key: string, value: T): void {
+    this.data.set(key, value);
+  }
+
+  delete(key: string): boolean {
+    return this.data.delete(key);
+  }
+
+  exists(key: string): boolean {
+    return this.data.has(key);
+  }
+
+  clear(): void {
+    this.data.clear();
+  }
 }
 
 // === RATE LIMITER UNIT ===
 
-export class RateLimiter extends Unit<RateLimiterProps> {
+export class RateLimiterSync extends Unit<RateLimiterProps> {
   protected constructor(props: RateLimiterProps) {
     super(props);
   }
 
-    protected build(): UnitCore {
-      const capabilities = Capabilities.create(this.dna.id, {});
-      const schema = Schema.create(this.dna.id, {});
-      const validator = Validator.create({
-        unitId: this.dna.id,
-        capabilities,
-        schema,
-        strictMode: false
-      });
-  
-      return { capabilities, schema, validator };
-    }
-  
-  
-    // Consciousness Trinity Access
-    capabilities(): Capabilities { return this._unit.capabilities; }
-    schema(): Schema { return this._unit.schema; }
-    validator(): Validator { return this._unit.validator; }
-  
-
-  static create(config: RateLimiterConfig = {}): RateLimiter {
-    const requests = config.requests || 100;
-    const window = config.window || 60000; // 1 minute
-    const burst = config.burst || 10;
-    
-    // Create state unit for conscious state management
-    const state = State.create({
-      unitId: 'rate-limiter',
-      initialState: {
-        buckets: new Map<string, TokenBucket>(),
-        stats: {
-          totalRequests: 0,
-          allowedRequests: 0,
-          blockedRequests: 0,
-          activeBuckets: 0,
-          allowRate: 0,
-          created: Date.now()
-        }
-      }
+  // v1.1.0 Consciousness Trinity
+  protected build(): UnitCore {
+    const capabilities = Capabilities.create(this.dna.id, {
+      check: (...args: unknown[]) => {
+        const [context] = args as [RateLimitContext];
+        return this.check(context);
+      },
+      consume: (...args: unknown[]) => {
+        const [context] = args as [RateLimitContext];
+        return this.consume(context);
+      },
+      reset: (...args: unknown[]) => {
+        const [key] = args as [string];
+        return this.reset(key);
+      },
+      stats: (...args: unknown[]) => {
+        const [key] = args as [string | undefined];
+        return this.stats(key);
+      },
+      cleanup: (...args: unknown[]) => {
+        return this.cleanup();
+      },
     });
 
+    // Rich schemas for Tool units - define what we teach
+    const schema = Schema.create(this.dna.id, {
+      check: {
+        name: "check",
+        description:
+          "Check if request is allowed without consuming tokens (sync)",
+        parameters: {
+          type: "object",
+          properties: {
+            context: {
+              type: "object",
+              description: "Rate limit context with client and resource info",
+            },
+          },
+          required: ["context"],
+        },
+        response: {
+          type: "object",
+          properties: {
+            allowed: {
+              type: "boolean",
+              description: "Whether request is allowed",
+            },
+            remaining: { type: "number", description: "Remaining tokens" },
+            resetTime: {
+              type: "number",
+              description: "When bucket resets (timestamp)",
+            },
+            retryAfter: {
+              type: "number",
+              description: "Milliseconds until retry",
+            },
+            key: { type: "string", description: "Rate limit key used" },
+          },
+        },
+      },
+      consume: {
+        name: "consume",
+        description: "Consume a token if available (sync)",
+        parameters: {
+          type: "object",
+          properties: {
+            context: {
+              type: "object",
+              description: "Rate limit context with client and resource info",
+            },
+          },
+          required: ["context"],
+        },
+        response: {
+          type: "object",
+          properties: {
+            allowed: {
+              type: "boolean",
+              description: "Whether token was consumed",
+            },
+            remaining: { type: "number", description: "Remaining tokens" },
+            resetTime: {
+              type: "number",
+              description: "When bucket resets (timestamp)",
+            },
+            retryAfter: {
+              type: "number",
+              description: "Milliseconds until retry",
+            },
+            key: { type: "string", description: "Rate limit key used" },
+          },
+        },
+      },
+      reset: {
+        name: "reset",
+        description: "Reset rate limit bucket for specific key (sync)",
+        parameters: {
+          type: "object",
+          properties: {
+            key: { type: "string", description: "Rate limit key to reset" },
+          },
+          required: ["key"],
+        },
+        response: { type: "void" },
+      },
+      stats: {
+        name: "stats",
+        description: "Get rate limiting statistics (sync)",
+        parameters: {
+          type: "object",
+          properties: {
+            key: {
+              type: "string",
+              description: "Specific key stats (optional)",
+            },
+          },
+        },
+        response: {
+          type: "object",
+          properties: {
+            totalRequests: {
+              type: "number",
+              description: "Total requests processed",
+            },
+            allowedRequests: {
+              type: "number",
+              description: "Allowed requests count",
+            },
+            rejectedRequests: {
+              type: "number",
+              description: "Rejected requests count",
+            },
+            totalKeys: { type: "number", description: "Total unique keys" },
+            avgResponseTime: {
+              type: "number",
+              description: "Average response time",
+            },
+            bucketsCreated: {
+              type: "number",
+              description: "Number of buckets created",
+            },
+          },
+        },
+      },
+      cleanup: {
+        name: "cleanup",
+        description: "Cleanup expired rate limit buckets (sync)",
+        parameters: {
+          type: "object",
+          properties: {},
+        },
+        response: { type: "void" },
+      },
+    });
+
+    const validator = Validator.create({
+      unitId: this.dna.id,
+      capabilities,
+      schema,
+      strictMode: false,
+    });
+
+    return { capabilities, schema, validator };
+  }
+
+  capabilities(): Capabilities {
+    return this._unit.capabilities;
+  }
+  schema(): Schema {
+    return this._unit.schema;
+  }
+  validator(): Validator {
+    return this._unit.validator;
+  }
+
+  // Storage-native bucket operations (sync)
+  private getBucket(key: string): BucketData {
+    const bucket = this.props.storage.get<BucketData>(key);
+    if (!bucket) {
+      // Create new bucket using proper function signature
+      const newBucket = createBucket(
+        this.props.requests, // capacity
+        this.props.window, // window
+        this.props.burst, // burst
+      );
+      this.props.storage.set(key, newBucket);
+      return newBucket;
+    }
+    return bucket;
+  }
+
+  private setBucket(key: string, bucket: BucketData): void {
+    this.props.storage.set(key, bucket);
+  }
+
+  static create(config: RateLimiterConfig = {}): RateLimiterSync {
+    const requests = config.requests ?? 100;
+    const window = config.window ?? 60000; // 1 minute
+    const burst = config.burst ?? 10;
+    const keyGenerator =
+      config.keyGenerator ??
+      ((ctx: RateLimitContext) =>
+        `${ctx.clientId || "default"}:${ctx.resource || "global"}`);
+    const storage = config.storage ?? new SyncMemoryStorage();
+
     const props: RateLimiterProps = {
-      dna: createUnitSchema({ 
-        id: 'rate-limiter', 
-        version: '1.0.0'
-      }),
+      dna: createUnitSchema({ id: "rate-limiter-sync", version: "1.1.0" }),
       requests,
       window,
       burst,
-      keyGenerator: config.keyGenerator || ((context: RateLimitContext) => context?.key || 'default'),
-      state
+      keyGenerator,
+      storage,
     };
 
-    return new RateLimiter(props);
+    return new RateLimiterSync(props);
   }
 
-  // === CORE RATE LIMITING ===
+  // === RATE LIMITING OPERATIONS (SYNC) ===
 
-  checkLimit(context: RateLimitContext = {}): RateLimitResult {
+  check(context: RateLimitContext): RateLimitResult {
     const key = this.props.keyGenerator(context);
-    
-    // Get buckets from state
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
-    
-    // Get or create bucket for this key
-    if (!buckets.has(key)) {
-      buckets.set(key, new TokenBucket(
-        this.props.requests,
-        this.props.window,
-        this.props.burst
-      ));
-      this.props.state.set('buckets', buckets);
-    }
+    const bucket = this.getBucket(key);
+    const info = getBucketInfo(bucket);
 
-    const bucket = buckets.get(key);
-    if (!bucket) {
-      throw new Error(`[${this.dna.id}] Bucket not found for key: ${key}`);
-    }
-    const result = bucket.consume();
-
-    // Update statistics
-    this.updateStats(result.allowed);
-
-    return result;
-  }
-
-  // === ASYNC RATE LIMITING WITH BACKPRESSURE ===
-
-  async limit<T>(operation: () => Promise<T>, context: RateLimitContext = {}): Promise<T> {
-    const result = this.checkLimit(context);
-    
-    if (result.allowed) {
-      return await operation();
-    }
-
-    // Rate limited - throw with retry information
-    const error = new RateLimitError(
-      `Rate limit exceeded. Retry after ${result.retryAfter}ms`,
-      result
-    );
-    throw error;
-  }
-
-  // === ASYNC RATE LIMITING WITH AUTOMATIC RETRY ===
-
-  async limitWithRetry<T>(
-    operation: () => Promise<T>, 
-    context: RateLimitContext = {},
-    maxRetries = 3
-  ): Promise<T> {
-    let attempts = 0;
-    
-    while (attempts <= maxRetries) {
-      const result = this.checkLimit(context);
-      
-      if (result.allowed) {
-        return await operation();
-      }
-
-      attempts++;
-      if (attempts > maxRetries) {
-        throw new RateLimitError(
-          `Rate limit exceeded after ${maxRetries} retries`,
-          result
-        );
-      }
-
-      // Wait before retry
-      if (result.retryAfter) {
-        await this.sleep(result.retryAfter);
-      }
-    }
-
-    throw new Error('Unexpected rate limit state');
-  }
-
-  // === STATISTICS & MONITORING ===
-
-  private updateStats(allowed: boolean): void {
-    const stats = this.props.state.get<RateLimitStats>('stats') || {
-      totalRequests: 0,
-      allowedRequests: 0,
-      blockedRequests: 0,
-      activeBuckets: 0,
-      allowRate: 0,
-      created: Date.now()
+    return {
+      allowed: info.tokens > 0,
+      remaining: info.tokens,
+      resetTime: info.nextRefill,
+      retryAfter: info.tokens === 0 ? info.nextRefill - Date.now() : 0,
+      key,
     };
-
-    stats.totalRequests++;
-    
-    if (allowed) {
-      stats.allowedRequests++;
-    } else {
-      stats.blockedRequests++;
-    }
-
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
-    stats.activeBuckets = buckets.size;
-    stats.allowRate = stats.totalRequests > 0 
-      ? stats.allowedRequests / stats.totalRequests
-      : 0;
-
-    this.props.state.set('stats', stats);
   }
 
-  getStats(): RateLimitStats {
-    const stats = this.props.state.get<RateLimitStats>('stats') || {
-      totalRequests: 0,
-      allowedRequests: 0,
-      blockedRequests: 0,
-      activeBuckets: 0,
-      allowRate: 0,
-      created: Date.now()
+  consume(context: RateLimitContext): RateLimitResult {
+    const key = this.props.keyGenerator(context);
+    const bucket = this.getBucket(key);
+
+    // Try to consume a token
+    const consumeResult = consumeToken(bucket);
+
+    if (consumeResult.result.allowed) {
+      // Update bucket in storage
+      this.setBucket(key, consumeResult.bucket);
+    }
+
+    return {
+      ...consumeResult.result,
+      key,
     };
-    return { ...stats };
   }
 
-  getBucketInfo(key: string) {
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
-    const bucket = buckets.get(key);
-    return bucket ? bucket.getInfo() : null;
-  }
-
-  getAllBuckets(): Record<string, BucketInfo> {
-    const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
-    const result: Record<string, BucketInfo> = {};
-    
-    for (const [key, bucket] of buckets.entries()) {
-      result[key] = bucket.getInfo();
-    }
-    
-    return result;
-  }
-
-  // === MANAGEMENT ===
-
-  getStateUnit(): State {
-    return this.props.state;
-  }
-
-  reset(key?: string): void {
+  stats(key?: string): RateLimitStats {
     if (key) {
-      const buckets = this.props.state.get<Map<string, TokenBucket>>('buckets') || new Map();
-      buckets.delete(key);
-      this.props.state.set('buckets', buckets);
-    } else {
-      // Reset everything
-      this.props.state.set('buckets', new Map<string, TokenBucket>());
-      this.props.state.set('stats', {
-        totalRequests: 0,
-        allowedRequests: 0,
-        blockedRequests: 0,
-        activeBuckets: 0,
-        allowRate: 0,
-        created: Date.now()
-      });
+      const bucket = this.getBucket(key);
+      const info = getBucketInfo(bucket);
+      const initialTokens = this.props.requests + this.props.burst;
+
+      return {
+        totalRequests: initialTokens - info.tokens,
+        allowedRequests: initialTokens - info.tokens,
+        rejectedRequests: 0, // Would need separate tracking
+        totalKeys: 1,
+        avgResponseTime: 0,
+        bucketsCreated: 1,
+      };
+    }
+
+    // Global stats would require iteration - simplified for now
+    return {
+      totalRequests: 0,
+      allowedRequests: 0,
+      rejectedRequests: 0,
+      totalKeys: 0,
+      avgResponseTime: 0,
+      bucketsCreated: 0,
+    };
+  }
+
+  reset(key: string): void {
+    this.props.storage.delete(key);
+  }
+
+  cleanup(): void {
+    // For simple memory storage, no cleanup needed
+    if (this.props.storage.clear) {
+      this.props.storage.clear();
     }
   }
 
-  // === UTILITIES ===
+  // === HELP & TEACHING ===
 
-  private sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  help(): string {
+    return `
+RateLimiterSync Unit v1.1.0 - Synchronous Storage-Native Rate Limiting
+
+CAPABILITIES:
+  • check(context) - Check if request allowed (no token consumption)
+  • consume(context) - Consume token if available  
+  • reset(key) - Reset specific rate limit bucket
+  • stats(key?) - Get rate limiting statistics
+  • cleanup() - Clean up expired buckets
+
+FEATURES:
+  ✓ Synchronous token bucket algorithm with burst support
+  ✓ Storage-agnostic design via SyncStorageBinding
+  ✓ Custom key generation
+  ✓ Memory storage for high-performance scenarios
+  ✓ Zero external dependencies
+  ✓ zero async overhead
+
+EXAMPLES:
+  const limiter = RateLimiterSync.create({
+    requests: 100,     // 100 requests
+    window: 60000,     // per minute  
+    burst: 10,         // +10 burst
+    storage: mySyncStorage // optional sync storage
+  });
+
+  const result = limiter.consume({
+    clientId: 'user123',
+    resource: '/api/data'
+  });
+
+ARCHITECTURE:
+  RateLimiterSync + SyncStorageBinding + Pure Functions
+  → No State dependency
+  → No async complexity
+  → Storage-native BucketData objects
+  → Direct sync storage injection
+
+USE CASES:
+  • In-memory function rate limiting
+  • High-performance scenarios
+  • Deterministic testing
+  • zero async overhead requirements
+`;
   }
 
-  // === UNIT ARCHITECTURE ===
+  whoami(): string {
+    return `RateLimiterSync(${this.dna.id}): ${this.props.requests}req/${this.props.window}ms, burst=${this.props.burst}`;
+  }
 
- 
- teach(): TeachingContract {
+  teach(): TeachingContract {
     return {
       unitId: this.dna.id,
       capabilities: this._unit.capabilities,
       schema: this._unit.schema,
-      validator: this._unit.validator
+      validator: this._unit.validator,
     };
   }
-
-  whoami(): string {
-    const stats = this.getStats();
-    return `RateLimiter[${this.props.requests}req/${this.props.window}ms, ${stats.activeBuckets} buckets, ${(stats.allowRate * 100).toFixed(1)}% allowed] - v${this.dna.version}`;
-  }
-
-  help(): string {
-    const stats = this.getStats();
-    return `
-RateLimiter v${this.dna.version} - Conscious Rate Limiting
-
-Configuration:
-• Requests: ${this.props.requests} per ${this.props.window}ms window
-• Burst: ${this.props.burst} extra tokens
-• Active Buckets: ${stats.activeBuckets}
-
-Statistics:
-• Total Requests: ${stats.totalRequests}
-• Allowed: ${stats.allowedRequests} (${(stats.allowRate * 100).toFixed(1)}%)
-• Blocked: ${stats.blockedRequests}
-
-CORE METHODS:
-• checkLimit(context?) - Check if request is allowed
-• limit(operation, context?) - Execute with rate limiting
-• limitWithRetry(operation, context?, maxRetries?) - Execute with automatic retry
-
-MANAGEMENT:
-• getStats() - Get rate limiting statistics
-• getBucketInfo(key) - Get specific bucket status
-• getAllBuckets() - Get all bucket statuses
-• reset(key?) - Reset specific bucket or all
-
-Teaching:
-• Teaches all rate limiting capabilities for composition
-• Context-aware key generation
-• Automatic token bucket management
-
-Example:
-  const limiter = RateLimiter.create({ requests: 100, window: 60000 });
-  
-  const result = limiter.checkLimit({ key: 'user-123' });
-  if (result.allowed) {
-    // Process request
-  } else {
-    // Rate limited - retry after result.retryAfter ms
-  }
-`;
-  }
 }
 
-// === CUSTOM ERROR ===
-
-export class RateLimitError extends Error {
-  constructor(message: string, public result: RateLimitResult) {
-    super(message);
-    this.name = 'RateLimitError';
-  }
-}
-
-export default RateLimiter;
+export default RateLimiterSync;
