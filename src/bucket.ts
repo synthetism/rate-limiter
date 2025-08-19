@@ -80,15 +80,15 @@ export function refillBucket(bucket: BucketData): BucketData {
       tokens: bucket.burstCapacity,
       lastRefill: now,
     };
-  } else {
-    // Gradual refill based on time passed - up to burst capacity
-    const tokensToAdd = timePassed * bucket.refillRate;
-    return {
-      ...bucket,
-      tokens: Math.min(bucket.burstCapacity, bucket.tokens + tokensToAdd),
-      lastRefill: now,
-    };
-  }
+  } 
+  // Gradual refill based on time passed - up to burst capacity
+  const tokensToAdd = timePassed * bucket.refillRate;
+  return {
+    ...bucket,
+    tokens: Math.min(bucket.burstCapacity, bucket.tokens + tokensToAdd),
+    lastRefill: now,
+  };
+
 }
 
 export function getBucketInfo(bucket: BucketData): BucketInfo {

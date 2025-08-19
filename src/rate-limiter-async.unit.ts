@@ -50,10 +50,10 @@ export interface RateLimiterProps extends UnitProps {
 
 // Simple memory storage for default behavior
 class MemoryStorage implements StorageBinding {
-  private data = new Map<string, any>();
+  private data = new Map<string, unknown>();
 
   async get<T>(key: string): Promise<T | null> {
-    return this.data.get(key) || null;
+    return (this.data.get(key) as T) || null;
   }
 
   async set<T>(key: string, value: T): Promise<void> {

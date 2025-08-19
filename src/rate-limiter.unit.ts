@@ -50,10 +50,10 @@ export interface RateLimiterProps extends UnitProps {
 
 // Simple sync memory storage for default behavior
 class SyncMemoryStorage implements SyncStorageBinding {
-  private data = new Map<string, any>();
+  private data = new Map<string, unknown>();
 
   get<T>(key: string): T | null {
-    return this.data.get(key) || null;
+    return (this.data.get(key) as T) || null;
   }
 
   set<T>(key: string, value: T): void {
